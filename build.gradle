@@ -1,0 +1,28 @@
+plugins {
+    id 'java'
+}
+
+group = 'org.example'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation "org.neo4j:neo4j:5.24.0"
+    testImplementation 'junit:junit:4.13.2'
+}
+
+jar {
+    manifest {
+        attributes(
+            "Main-Class": "org.example.md.HelloProcedures"
+        )
+    }
+}
+java {
+  toolchain {
+    languageVersion = JavaLanguageVersion.of(17)
+  }
+}

@@ -1,0 +1,1872 @@
+# distutils: language = c++
+# distutils: extra_compile_args = -std=c++11
+r"""
+Modular decomposition
+
+AUTHORS:
+
+- Cyril Bouvier (2024-07-01): initial version
+"""
+# ****************************************************************************
+# Copyright (C) 2024 Cyril Bouvier <cyril.bouvier@lirmm.fr>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#                  https://www.gnu.org/licenses/
+# ****************************************************************************
+
+from libc.stdint cimport SIZE_MAX, uint8_t
+from libcpp cimport bool
+from libcpp.pair cimport pair
+from libcpp.vector cimport vector
+from libcpp.unordered_map cimport unordered_map
+from libcpp.unordered_set cimport unordered_set
+from libcpp.queue cimport queue
+from libcpp.list cimport list as cpplist
+from libcpp.algorithm cimport swap
+from cython.operator cimport dereference as deref
+from cython.operator cimport address, preincrement
+
+from itertools import chain
+
+from sage.graphs.base.c_graph cimport CGraph, CGraphBackend
+from sage.data_structures.bitset_base cimport bitset_in
+
+try:
+    from sage.graphs.graph_decompositions.modular_decomposition import (
+        create_prime_node, create_normal_node, create_parallel_node,
+        create_series_node, Node, NodeType
+    )
+except ImportError:
+    # Fallback compatibility layer for Sage versions where these symbols moved/changed
+    from enum import Enum
+
+    class NodeType(Enum):
+        PRIME = "PRIME"
+        SERIES = "SERIES"
+        PARALLEL = "PARALLEL"
+        NORMAL = "NORMAL"
+
+    class Node:
+        def __init__(self, node_type, children=None, vertex=None):
+            self.node_type = node_type
+            self.children = list(children) if children is not None else []
+            self.vertex = vertex
+
+    def create_prime_node(children=None):
+        return Node(NodeType.PRIME, children=[] if children is None else children)
+
+    def create_series_node(children=None):
+        return Node(NodeType.SERIES, children=[] if children is None else children)
+
+    def create_parallel_node(children=None):
+        return Node(NodeType.PARALLEL, children=[] if children is None else children)
+
+    def create_normal_node(v):
+        return Node(NodeType.NORMAL, children=[], vertex=v)
+
+
+
+from sage.structure.sage_object cimport SageObject  # not needed in SageMath src
+from sage.graphs.graph import Graph  # not needed in SageMath src
+
+
+cdef struct slice_decomposition:
+    size_t length
+    size_t lex_label_offset
+    const int *sigma
+    const size_t *xslice_len
+    const vector[int] *lex_label
+
+cdef size_t SD_lex_label_size(const slice_decomposition &SD, size_t i):
+    if SD.lex_label[i].size() <= SD.lex_label_offset:
+        return 0
+    else:
+        return SD.lex_label[i].size() - SD.lex_label_offset
+
+# Some constants
+cdef enum:
+    PRIME = -1
+    SERIES = -2
+    PARALLEL = -3
+    UNKNOWN = -4
+
+    FLAGo = 0
+    FLAGs = 1
+    EMPTY = 0b00
+    HOMOGENEOUS = 0b01
+    BROKEN = 0b10
+    DEAD = 0b11
+
+ctypedef uint8_t label_t
+ctypedef bool flag_t
+
+cdef extern from *:
+    """
+    #include <vector>
+
+    using label_t = uint8_t;
+    using flag_t = bool;
+
+    class md_tree_node {
+        public:
+            md_tree_node(md_tree_node *parent, size_t nb_expected, int type,
+                         label_t label, flag_t flag, size_t slice_or_cc_tag)
+                    : parent(parent), type(type), label(label), flag(flag),
+                      slice_or_cc_tag(slice_or_cc_tag) {
+                if (nb_expected != SIZE_MAX) {
+                    children.reserve(nb_expected);
+                }
+            }
+
+            bool is_leaf() const {
+                return type >= 0;
+            }
+
+            bool is_degenerate() const {
+                return type <= -2; /* degenerate types are -2 and -3 */
+            }
+
+            bool is_dead_or_broken() const {
+                return label >> 1U;
+            }
+
+            bool is_homogeneous_or_empty() const {
+                return !(label >> 1U);
+            }
+
+            void append_new_child(md_tree_node *c) {
+                c->parent = this;
+                children.push_back(c);
+            }
+
+            void set_label_and_flag_recursively(label_t l, flag_t f) {
+                label = l;
+                flag = f;
+                for (md_tree_node *c: children) {
+                    c->set_label_and_flag_recursively(l, f);
+                }
+            }
+
+            md_tree_node *parent;
+            std::vector<md_tree_node *> children;
+            int type;
+            label_t label;
+            flag_t flag;
+            size_t slice_or_cc_tag;
+    };
+    """
+    cdef cppclass md_tree_node:
+        md_tree_node(md_tree_node *parent, size_t nchildren_expected, int type,
+                     label_t l, flag_t flag, size_t slice_or_cc_tag) except +
+        bool is_leaf() const
+        bool is_degenerate() const
+        bool is_dead_or_broken() const
+        bool is_homogeneous_or_empty() const
+        void append_new_child(md_tree_node *) except +
+        void set_label_and_flag_recursively(label_t, flag_t)
+
+        md_tree_node *parent
+        vector[md_tree_node *] children
+        # type = -1 for prime, -2 for serie, -3 for parallel, and, when
+        # children.size() == 0, type holds the vertex.
+        int type
+        # label: 00 => empty, 01 => homogeneous, 10 => broken, 11 => dead
+        label_t label
+        # flag: False => o, True => *
+        flag_t flag
+        # used to identify clusters
+        size_t slice_or_cc_tag
+
+# This typedef is needed because Cython returns the syntax error "Expected
+# an identifier or literal" when trying to use pointer as template parameter
+# (as in pair[md_tree_node *, another_type])
+ctypedef md_tree_node * md_tree_node_ptr
+
+cdef class MDForest:
+    cdef cpplist[md_tree_node *] roots
+
+    def __dealloc__(self):
+        for r in self.roots:
+            MDForest._dealloc_md_tree_nodes_inner_rec(r)
+
+    @staticmethod
+    cdef _dealloc_md_tree_nodes_inner_rec(md_tree_node *n):
+        cdef md_tree_node *c
+        for c in deref(n).children:
+            MDForest._dealloc_md_tree_nodes_inner_rec(c)
+        del n
+
+    cdef md_tree_node * add(
+            self, int type, md_tree_node *parent=NULL,
+            size_t nchildren_expected=SIZE_MAX,
+            label_t label=EMPTY, flag_t flag=FLAGo,
+            size_t slice_or_cc_tag=SIZE_MAX):
+        """
+        Assumes parent is not a leaf
+        """
+        cdef md_tree_node *newnode
+        newnode = new md_tree_node(parent, nchildren_expected, type, label,
+                                   flag, slice_or_cc_tag)
+        if parent == NULL:
+            self.roots.push_back(newnode)
+        else:
+            deref(parent).children.push_back(newnode)
+        return newnode
+
+    cdef void set_label_and_flag(self, label_t label, flag_t flag):
+        cdef md_tree_node *r
+        for r in self.roots:
+            r.set_label_and_flag_recursively(label, flag)
+
+    cdef void set_connected_components_tag(self, bint first):
+        cdef md_tree_node *r
+        cdef md_tree_node *c
+        cdef size_t i, t
+        for r in self.roots:
+            t = deref(r).type
+            i = 0
+            if t == PRIME or t == (PARALLEL if first else SERIES):
+                deref(r).slice_or_cc_tag = i
+            else:
+                deref(r).slice_or_cc_tag = SIZE_MAX
+                for c in deref(r).children:
+                    deref(c).slice_or_cc_tag = i
+                    i += 1
+
+    @staticmethod
+    cdef object _to_md_tree_inner_rec(md_tree_node *n, CGraphBackend Gb):
+        cdef md_tree_node *c
+        if deref(n).is_leaf():
+            return create_normal_node(Gb.vertex_label(deref(n).type))
+        else:
+            if deref(n).type == SERIES:
+                node = create_series_node()
+            elif deref(n).type == PARALLEL:
+                node = create_parallel_node()
+            else:  # prime
+                node = create_prime_node()
+            node.children.extend(
+                MDForest._to_md_tree_inner_rec(c, Gb)
+                                                for c in deref(n).children)
+            return node
+
+    cdef object to_md_tree(self, CGraphBackend Gb):
+        if self.roots.size() == 0:
+            return None
+        elif self.roots.size() == 1:
+            return MDForest._to_md_tree_inner_rec(self.roots.front(), Gb)
+        else:
+            raise ValueError("Error, not a tree")
+
+    @staticmethod
+    cdef bint _check_inner_rec(md_tree_node *n, unordered_set[int] &leaves):
+        cdef int t = deref(n).type
+        cdef bool b
+        cdef md_tree_node *c
+        if deref(n).is_leaf():
+            leaves.insert(t)
+            b = t >= 0 and deref(n).children.size() == 0
+        else:
+            b = t < 0 and deref(n).children.size() >= 2 and t != UNKNOWN
+            for c in deref(n).children:
+                b = b and MDForest._check_inner_rec(c, leaves)
+                b = b and c.parent == n
+        return b
+
+    cdef bint check(self, const slice_decomposition &sd):
+        cdef unordered_set[int] leaves
+        cdef size_t i
+        b = True
+        for r in self.roots:
+            b = b and deref(r).parent == NULL
+            b = b and MDForest._check_inner_rec(r, leaves)
+        b = b and leaves.size() == sd.length
+        for i in range(sd.length):
+            b = b and leaves.find(sd.sigma[i]) != leaves.end()
+        return b
+
+# Copy from code from PR#38299
+cdef void extended_lex_BFS(
+        CGraph cg, vector[int] &sigma, vector[int] *sigma_inv,
+        int initial_v_int, vector[int] *pred, vector[size_t] *xslice_len,
+        vector[vector[int]] *lex_label) except *:
+    r"""
+    Perform a extended lexicographic breadth first search (LexBFS) on the
+    undirected graph `G`. In addition to computing a LexBFS ordering, the
+    extended LexBFS algorithm can be used to compute the slice decomposition of
+    the graph.
+
+    This function implements the `O(n+m)` time algorithm proposed in [HMPV2000]_
+    and [TCHP2008]_.
+
+    INPUT:
+
+    - ``cg`` -- a ``CGraph``. This function ignores loops and multiple edges and
+      assumes that the graph is undirected.
+
+    - ``sigma`` -- vector of ``int`` to store the ordering of the vertices
+      resulting from the LexBFS traversal. At the end, the vector will have size
+      `n` (the number of vertices of the graph).
+
+    - ``sigma_inv`` -- a pointer to a vector to store the inverse of the
+      permutation ``sigma``. ``sigma_inv`` can be ``NULL`` if the caller does
+      not need it (but, note that, the inverse of ``sigma`` is still needed by
+      the algorithm, so it does not save time nor memory to have ``sigma_inv``
+      equal to ``NULL``). At the end, if ``sigma_inv`` is not NULL, the vector
+      pointer by it will have size `n` (the number of vertices of the graph)
+      and will satisfy:
+        * sigma[deref(sigma_inv)[v_int]] = v_int
+        * deref(sigma_inv)[sigma[i]] = i
+
+    - ``initial_v_int`` -- the first vertex to consider, can be -1.
+
+    - ``pred`` -- a pointer to a vector of int to store the predecessor of a
+      vertex in the LexBFS traversal. ``pred`` can be ``NULL`` if the caller
+      does not need it (and the information will not be computed by the
+      algorithm). At the end, if ``pred`` is not NULL, the vector pointer by it
+      will have size `n` (the number of vertices of the graph) and pred[i] will
+      be either -1 (if sigma[i] as no predecessor) or a positive value less than
+      n such that the predecessor of sigma[i] is sigma[pred[i]].
+
+    - ``xslice_len`` -- a pointer to a vector of size_t to store the length of
+      the x-slices associated with the lexBFS traversal. ``xslice_len`` can be
+      ``NULL`` if the caller does not need it (and the information will not be
+      computed by the algorithm). At the end, if ``xslice_len`` is not NULL, the
+      vector pointer by it will have size `n` (the number of vertices of the
+      graph) and the length of the x-slice starting at sigma[i] will be
+      xslice_len[i].
+
+    - ``lex_label`` -- a pointer to a vector of vector[int] to store the
+      lexicographic labels associated with the lexBFS traversal. ``lex_label``
+      can be ``NULL`` if the caller does not need it (and the information will
+      not be computed by the algorithm). At the end, if ``lex_label`` is not
+      NULL, the vector pointer by it will have size `n` (the number of
+      vertices of the graph) and the lexicographic label of sigma[i]
+      will given by lex_label[i].
+
+    ALGORITHM:
+
+    This algorithm uses the notion of *partition refinement* to determine the
+    exact position of the vertices in the ordering.
+
+    Consider an ordering `\sigma` of the vertices. For a vertex `v`, we define
+    `N_i(v) = \{u | u \in N(v) \text{ and } \sigma(u) < i\}`, that is the subset
+    of neighbors of `v` appearing before the `i`-th vertex in the ordering
+    `\sigma`. Now, a part of an ordering `\sigma` is a set of consecutive
+    vertices, `S = \{u | i \leq \sigma(u) \leq j\}`, such that for any `u \in
+    S`, we have `N_i(u) = N_i(\sigma^{-1}(i))` and for any `v` such that `j <
+    \sigma(v)`, `N_i(v) \neq N_i(\sigma^{-1}(i))`. The *head* of a part is the
+    first position of its vertices.
+
+    The algorithm starts with a single part containing all vertices. Then, when
+    the position of the `i`-th vertex `v` is fixed, it explores the neighbors of
+    `v` that have not yet been ordered. Consider a part `S` such that `N(x)\cap
+    S \neq \emptyset`. The algorithm will rearrange the ordering of the vertices
+    in `S` so that the first vertices are the neighbors of `v`. The subpart
+    containing the neighbors of `v` is assigned a new name, and the head of `S`
+    is set to the position of the first vertex of `S \setminus N(v)` in the
+    ordering `\sigma`.
+
+    Observe that each arc of the graph can induce the subdivision of a part.
+    Hence, the algorithm can use up to `m + 1` different parts.
+
+    The time complexity of this algorithm is in `O(n + m)`, and our
+    implementation follows that complexity ``SparseGraph``. For ``DenseGraph``,
+    the complexity is `O(n^2)`. See [HMPV2000]_ and [TCHP2008]_ for more
+    details.
+
+    This implementation of extended LexBFS offers some guarantee on the order in
+    which the vertices appear in the computed ordering: in case of a tie between
+    lexicographic labels during the computation, this function will "choose" the
+    vertices in the order in which they appear during the enumeration of the
+    neighbors of their last common neighbor.
+    For example, if `(u_0, ..., u_k)` is the beginning of the ordering being
+    computed and the vertices `v` and `w` currently have the same lexicographic
+    label (it means that they have the same neighbors in `(u_0, ..., u_k)`).
+    Let call `u_j` their last neighbor in the current ordering (*i.e.*, for all
+    `i > j`, `u_i` is not a neighbor of `v` and `w`). This implementation
+    will choose `v` for the next vertex of the ordering if and only if `v`
+    appeared before `w` when the neighbors of `u_j` where enumerated.
+
+    One possible use of this guarantee is that the caller can reorder the
+    adjacency list of vertices (by using, for example, a static sparse graph)
+    to force the computed LexBFS order to respect a previous one.
+
+    EXAMPLES:
+
+    To see how it can be used, see the code of the lex_BFS method (in
+    traversals.pyx) or of the class SliceDecomposition in this module.
+
+    """
+    cdef int n = <int> cg.num_verts
+    # Variables for the partition refinement algorithm
+    cdef size_t max_nparts = cg.num_arcs // 2 + 1
+    cdef bint need_to_delete_sigma_inv = sigma_inv == NULL
+    if sigma_inv == NULL:
+        sigma_inv = new vector[int]()
+    cdef vector[size_t] part_of = vector[size_t](n, 0)
+    cdef vector[size_t] part_len  # only used if xslice_len != NULL (see below)
+    cdef vector[size_t] part_head = vector[size_t](max_nparts)
+    cdef vector[size_t] subpart = vector[size_t](max_nparts)
+    cdef size_t p, part_of_i, nparts, old_nparts
+    # Temporary variables
+    cdef int max_degree = 0
+    cdef int i, j, k, l, u_int, v_int, t_int
+
+    # Resize vectors
+    sigma.resize(n)
+    deref(sigma_inv).resize(cg.active_vertices.size)
+    if pred != NULL:
+        deref(pred).clear()
+        deref(pred).resize(n, -1)  # initialize pred[i] to -1 for 0 <= i < n
+    if xslice_len != NULL:
+        deref(xslice_len).resize(n)
+        part_len.resize(max_nparts)
+    if lex_label != NULL:
+        deref(lex_label).resize(n)
+
+    # Initialize the position of vertices in sigma (and compute max_degree)
+    if initial_v_int >= 0:
+        sigma[0] = initial_v_int
+        deref(sigma_inv)[initial_v_int] = 0
+        i = 1
+    else:
+        i = 0
+    for v_int in range(<int> cg.active_vertices.size):
+        if bitset_in(cg.active_vertices, v_int):
+            if v_int != initial_v_int:
+                sigma[i] = v_int
+                deref(sigma_inv)[v_int] = i
+                i = i + 1
+            max_degree = max(max_degree, cg.out_degrees[v_int])
+
+    # Variables needed to iterate over neighbors of a vertex
+    cdef int nneighbors
+    cdef vector[int] neighbors = vector[int](max_degree)
+
+    # Initialize partition: one part containing all the vertices
+    nparts = 1
+    # all element of part_of are already initialized to 0
+    part_head[0] = 0
+    subpart[0] = 0
+    if xslice_len != NULL:
+        part_len[0] = n
+
+    # Main loop
+    for i in range(n):
+        old_nparts = nparts
+
+        part_of_i = part_of[i]
+
+        # put i out of its part (updating part_len if needed)
+        part_head[part_of_i] += 1
+        if xslice_len != NULL:
+            deref(xslice_len)[i] = part_len[part_of_i]
+            part_len[part_of_i] -= 1
+
+        v_int = sigma[i]
+
+        # Iterate over the neighbors of v
+        nneighbors = cg.out_neighbors_unsafe (v_int, neighbors.data(), max_degree)
+        for k in range(nneighbors):
+            u_int = neighbors[k]
+            j = deref(sigma_inv)[u_int]  # get the position of u
+            if j <= i:
+                continue  # already taken care of
+
+            if lex_label != NULL:
+                deref(lex_label)[j].push_back (v_int)
+
+            p = part_of[j]  # get the part of u
+            l = part_head[p]  # get the beginning of the part containing u
+
+            # if not last and next elem belongs in the same part (ie #part >= 2)
+            if l < n - 1 and part_of[l + 1] == p:
+                if l != j:  # not already first elem of the part
+                    # Place u at the position of the head of the part
+                    t_int = sigma[l]
+                    deref(sigma_inv)[t_int], deref(sigma_inv)[u_int] = j, l
+                    sigma[j], sigma[l] = t_int, u_int
+                    if lex_label != NULL:
+                        swap[vector[int]](deref(lex_label)[j],
+                                          deref(lex_label)[l])
+                    j = l
+                part_head[p] += 1  # move the head of the part to next elem
+
+            # if part p was not already cut in two during this iteration, we
+            # create a new part using subpart
+            if subpart[p] < old_nparts:
+                subpart[p] = nparts
+                part_head[nparts] = j
+                if xslice_len != NULL:
+                    part_len[nparts] = 0
+                subpart[nparts] = 0
+                nparts += 1
+
+            # Finally, we update the name of the part for position j and set v
+            # as predecessor of u
+            part_of[j] = subpart[p]
+            if xslice_len != NULL:
+                part_len[p] -= 1
+                part_len[subpart[p]] += 1
+            if pred != NULL:
+                deref(pred)[j] = i
+
+    if need_to_delete_sigma_inv:
+        del sigma_inv
+
+def _slice_decomposition(G, initial_vertex=None):
+    r"""
+    Compute a slice decomposition of the simple undirected graph
+
+    INPUT:
+
+    - ``G`` -- a Sage graph.
+
+    - ``initial_vertex`` -- (default: ``None``); the first vertex to consider.
+
+    OUTPUT:
+
+    An object of type :class:`~sage.graphs.graph_decompositions.slice_decomposition.SliceDecomposition`
+    that represents a slice decomposition of ``G``
+
+    .. NOTE::
+
+        Loops and multiple edges are ignored during the computation of the slice
+        decomposition.
+
+    ALGORITHM:
+
+    The method use the algorithm based on "partition refinement" described in
+    [HMPV2000]_ and [TCHP2008]_.
+    The time complexity of this algorithm is in `O(n + m)`, and our
+    implementation follows that complexity for ``SparseGraph``. For
+    ``DenseGraph``, the complexity is `O(n^2)`.
+
+    EXAMPLES:
+
+    Slice decomposition of the Petersen Graph::
+
+        sage: G = graphs.PetersenGraph()
+        sage: SD = G.slice_decomposition(); SD
+        [0[1[4[5]]] [2[6]] [3] [9] [7] [8]]
+
+    The graph can have loops or multiple edges but they are ignored::
+
+        sage: H = Graph(G,loops=True,multiedges=True)
+        sage: H.add_edges([(4, 4), (2, 2), (1, 6)])
+        sage: SD2 = H.slice_decomposition()
+        sage: SD2 == SD
+        True
+        sage: SD2.underlying_graph() == G.to_simple(immutable=True)
+        True
+
+    The tree corresponding to the slice decomposition can be displayed using
+    ``view``::
+
+        sage: from sage.graphs.graph_latex import check_tkz_graph
+        sage: check_tkz_graph()  # random - depends on Tex installation
+        sage: view(G)  # not tested
+        sage: latex(G)  # to obtain the corresponding LaTeX code
+        \begin{tikzpicture}
+        ...
+        \end{tikzpicture}
+
+    Slice decompositions are only defined for undirected graphs::
+
+        sage: from sage.graphs.graph_decompositions.slice_decomposition import slice_decomposition
+        sage: slice_decomposition(DiGraph())
+        Traceback (most recent call last):
+        ...
+        ValueError: parameter G must be an undirected graph
+    """
+    return SliceDecomposition(G, initial_vertex=initial_vertex)
+
+
+Graph.slice_decomposition = _slice_decomposition
+
+
+cdef class SliceDecomposition(SageObject):
+    cdef tuple sigma
+    cdef dict sigma_inv
+    cdef vector[size_t] xslice_len
+    cdef dict lex_label
+    cdef object _graph_class
+    cdef object _underlying_graph
+
+    def __init__(self, G, initial_vertex=None):
+        r"""
+        Represents a slice decomposition of a simple directed graph.
+
+        INPUT:
+
+        - ``G`` -- a Sage graph.
+
+        - ``initial_vertex`` -- (default: ``None``); the first vertex to
+          consider.
+
+        .. SEEALSO::
+
+            * :meth:`~slice_decomposition` -- compute a slice decomposition of
+              the simple undirected graph
+            * Section 3.2 of [TCHP2008]_ for a formal definition.
+
+        EXAMPLES:
+
+        The constructor of the :class:`~SliceDecomposition` class is called by
+        the :meth:`~slice_decomposition` method of undirected graphs::
+
+            sage: from sage.graphs.graph_decompositions.slice_decomposition import SliceDecomposition
+            sage: G = graphs.PetersenGraph()
+            sage: SliceDecomposition(G) == G.slice_decomposition()
+            True
+
+        The vertex appearing first in the slice decomposition can be specified::
+
+            sage: from sage.graphs.graph_decompositions.slice_decomposition import SliceDecomposition
+            sage: SliceDecomposition(graphs.PetersenGraph(), initial_vertex=3)
+            [3[2[4[8]]] [1[7]] [0] [9] [6] [5]]
+
+        Slice decompositions are not defined for directed graphs::
+
+            sage: from sage.graphs.graph_decompositions.slice_decomposition import SliceDecomposition
+            sage: SliceDecomposition(DiGraph())
+            Traceback (most recent call last):
+            ...
+            ValueError: parameter G must be an undirected graph
+
+        .. automethod:: __getitem__
+        """
+        if G.is_directed():
+            raise ValueError("parameter G must be an undirected graph")
+
+        if initial_vertex is not None and initial_vertex not in G:
+            raise LookupError(f"vertex ({initial_vertex}) is not a vertex of the graph")
+
+        cdef CGraphBackend Gbackend = <CGraphBackend> G._backend
+        cdef CGraph cg = Gbackend.cg()
+
+        self._graph_class = type(G)
+
+        cdef int initial_v_int
+        if initial_vertex is not None:
+            # we already checked that initial_vertex is in G
+            initial_v_int = Gbackend.get_vertex(initial_vertex)
+        else:
+            initial_v_int = -1
+
+        cdef vector[int] sigma
+        cdef vector[vector[int]] lex_label
+
+        # Compute the slice decomposition using the extended lexBFS algorithm
+        extended_lex_BFS(cg, sigma, NULL, initial_v_int, NULL,
+                         &(self.xslice_len), &lex_label)
+
+        # Translate the results with the actual vertices of the graph
+        self.sigma = tuple(Gbackend.vertex_label(v_int) for v_int in sigma)
+        self.sigma_inv = {v: i  for i, v in enumerate(self.sigma)}
+        self.lex_label = {i: tuple(Gbackend.vertex_label(v_int) for v_int in lli)
+                                    for i, lli in enumerate(lex_label)}
+
+    def __eq__(self, other):
+        """
+        Return whether ``self`` and ``other`` are equal.
+
+        TESTS::
+
+            sage: G = graphs.PetersenGraph()
+            sage: SD = G.slice_decomposition()
+            sage: SD == SD
+            True
+            sage: SD == G.slice_decomposition()
+            True
+
+            sage: P3 = graphs.PathGraph(3)
+            sage: SD1 = P3.slice_decomposition(initial_vertex=0)
+            sage: SD2 = P3.slice_decomposition(initial_vertex=2)
+            sage: SD1 == SD2
+            False
+            sage: SD3 = graphs.CompleteGraph(3).slice_decomposition()
+            sage: SD1 == SD3  # same lexBFS but different slice for 1
+            False
+            sage: SD4 = Graph([(0,1), (0,2)]).slice_decomposition()
+            sage: SD3 == SD4  # same lexBFS and slices but different active edges
+            False
+        """
+        if not isinstance(other, type(self)):
+            return False
+
+        cdef SliceDecomposition sd = <SliceDecomposition>other
+
+        return self.sigma_inv == sd.sigma_inv \
+                and self.lex_label == sd.lex_label \
+                and self.xslice_len == sd.xslice_len
+
+    def __hash__(self):
+        r"""
+        Compute a hash of a ``SliceDecomposition`` object.
+
+        TESTS::
+
+            sage: P3 = graphs.PathGraph(3)
+            sage: hash(P3.slice_decomposition(initial_vertex=0))
+            -7313201005658437102
+            sage: hash(P3.slice_decomposition(initial_vertex=2))
+            1181676064626878036
+            sage: hash(graphs.CompleteGraph(3).slice_decomposition())
+            6162668211142297415
+            sage: hash(Graph([(0,1), (0,2)]).slice_decomposition())
+            2898184589667302557
+        """
+        return hash((tuple(self.sigma_inv.items()),
+                     tuple(self.lex_label.items()),
+                     tuple(self.xslice_len)))
+
+    def __getitem__(self, v):
+        r"""
+        Return the data about the x-slice of the vertex `v`.
+
+        INPUT:
+
+        - ``v`` -- a vertex of the graph corresponding to the slice
+          decomposition.
+
+        OUTPUT:
+
+        A dictionnary with the keys:
+
+        * ``"pivot"`` -- the vertex `v` given as parameter
+
+        * ``"slice"`` -- the slice of `v` (see :meth:`~slice`)
+
+        * ``"active_edges"`` -- the actives edges of `v` (see
+          :meth:`~active_edges`)
+
+        * ``"lexicographic_label"`` -- the lexicographic label of `v` (see
+          :meth:`~lexicographic_label`)
+
+        * ``"sequence"`` -- the x-slice sequence of `v` (see
+          :meth:`~xslice_sequence`)
+
+        This method can also be called via :meth:`xslice_data`.
+
+        EXAMPLES:
+
+        ::
+
+            sage: G = Graph('L~mpn~Nrv{^o~_').relabel('abcdefguvwxyz',inplace=False)
+            sage: SD = G.slice_decomposition(initial_vertex='x')
+            sage: SD.xslice_data('a')
+            {'active_edges': [('a', 'b'),
+              ('a', 'c'),
+              ('a', 'd'),
+              ('a', 'e'),
+              ('a', 'f'),
+              ('c', 'g'),
+              ('d', 'g'),
+              ('f', 'g')],
+             'lexicographic_label': ['x'],
+             'pivot': 'a',
+             'sequence': [['a'], ['b', 'c', 'd', 'e', 'f'], ['g']],
+             'slice': ['a', 'b', 'c', 'd', 'e', 'f', 'g']}
+            sage: SD.xslice_data('u')
+            {'active_edges': [],
+             'lexicographic_label': ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
+             'pivot': 'u',
+             'sequence': [['u'], ['y', 'z']],
+             'slice': ['u', 'y', 'z']}
+
+        Some values of the returned dictionnary can be obtained via other
+        methods (:meth:`~slice`, :meth:`~xslice_sequence`,
+        :meth:`~active_edges`, :meth:`~lexicographic_label`)::
+
+            sage: SD.slice('a')
+            ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+            sage: SD.xslice_data('a')['slice']
+            ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+
+            sage: SD.xslice_sequence('a')
+            [['a'], ['b', 'c', 'd', 'e', 'f'], ['g']]
+            sage: SD.xslice_data('a')['sequence']
+            [['a'], ['b', 'c', 'd', 'e', 'f'], ['g']]
+
+            sage: SD.active_edges('b') == SD.xslice_data('b')['active_edges']
+            True
+
+            sage: SD.lexicographic_label('u')
+            ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+            sage: SD.xslice_data('u')['lexicographic_label']
+            ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+
+        TESTS::
+
+            sage: G = graphs.RandomGNP(15, 0.3)
+            sage: SD = G.slice_decomposition()
+            sage: all(SD[v]['slice'] == SD.slice(v) for v in G)
+            True
+            sage: all(SD[v]['sequence'] == SD.xslice_sequence(v) for v in G)
+            True
+            sage: all(SD[v]['active_edges'] == SD.active_edges(v) for v in G)
+            True
+            sage: all(SD[v]['lexicographic_label'] == SD.lexicographic_label(v) for v in G)
+            True
+
+            sage: SD = graphs.PetersenGraph().slice_decomposition()
+            sage: SD['John']
+            Traceback (most recent call last):
+            ...
+            LookupError: vertex (John) does not appear in the slice decomposition
+        """
+        if v not in self.sigma_inv:
+            raise LookupError(f"vertex ({v}) does not appear in the slice "
+                              "decomposition")
+        cdef size_t i = self.sigma_inv[v]
+        return {'pivot': v,
+                'slice': self._slice(i),
+                'sequence': self._xslice_sequence(i),
+                'lexicographic_label': self._xslice_lex_label(i),
+                'active_edges': self._xslice_active_edges(i),
+                }
+
+    def lexBFS_order(self):
+        r"""
+        Return the lexBFS order corresponding to the slice decomposition.
+
+        EXAMPLES::
+
+            sage: from sage.graphs.traversals import _is_valid_lex_BFS_order
+            sage: G = graphs.PetersenGraph(); SD = G.slice_decomposition()
+            sage: SD.lexBFS_order()
+            [0, 1, 4, 5, 2, 6, 3, 9, 7, 8]
+            sage: _is_valid_lex_BFS_order(G, SD.lexBFS_order())
+            True
+
+        TESTS::
+
+            sage: from sage.graphs.traversals import _is_valid_lex_BFS_order
+            sage: for _ in range(5):
+            ....:   G = graphs.RandomGNP(15, 0.3)
+            ....:   SD = G.slice_decomposition()
+            ....:   _is_valid_lex_BFS_order(G, SD.lexBFS_order())
+            True
+            True
+            True
+            True
+            True
+        """
+        return list(self.sigma)
+
+    def xslice_data(self, v):
+        r"""
+        Return the data about the x-slice of the vertex `v`.
+
+        This method is a wrapper around :meth:`SliceDecomposition.__getitem__`
+
+        TESTS::
+
+            sage: G = graphs.RandomGNP(15, 0.3)
+            sage: SD = G.slice_decomposition()
+            sage: all(SD[v] == SD.xslice_data(v) for v in G)
+            True
+        """
+        return self[v]
+
+    def slice(self, v):
+        r"""
+        Return the slice of the vertex `v`.
+
+        The slice of `v` is the list of vertices `u` such that the neighbors of
+        `u` that are before `v` in the lexBFS order are that same that the
+        neighbors of `v` that are before `v` in the lexBFS order (*i.e.*, the
+        lexicographic label of `v`). It can be shown that it is a factor of the
+        lexBFS order.
+
+        INPUT:
+
+        - ``v`` -- a vertex of the graph corresponding to the slice
+          decomposition.
+
+        OUTPUT:
+
+        A list of vertices
+
+        EXAMPLES:
+
+        ::
+
+            sage: G = Graph('L~mpn~Nrv{^o~_').relabel('abcdefguvwxyz',inplace=False)
+            sage: SD = G.slice_decomposition(initial_vertex='x')
+            sage: SD.slice('a')
+            ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+
+        The vertices of the slice have the same neighborhood "on the left"::
+
+            sage: pos = lambda v: SD.lexBFS_order().index(v)
+            sage: lla = set(SD.lexicographic_label('a'))
+            sage: all(lla == {u for u in G.neighbors(v) if pos(u) < pos('a')} \
+            ....:       for v in SD.slice('a'))
+            True
+
+        The slice is a factor of the lexBFS order::
+
+            sage: ''.join(SD.slice('a')) in ''.join(SD.lexBFS_order())
+            True
+
+        The slice of the initial vertex is the whole graph::
+
+            sage: SD.slice('x') == SD.lexBFS_order()
+            True
+
+        TESTS::
+
+            sage: SD.slice('Michael')
+            Traceback (most recent call last):
+            ...
+            LookupError: vertex (Michael) does not appear in the slice decomposition
+        """
+        if v not in self.sigma_inv:
+            raise LookupError(f"vertex ({v}) does not appear in the slice "
+                              "decomposition")
+        cdef size_t i = self.sigma_inv[v]
+        return self._slice(i)
+
+    def xslice_sequence(self, v):
+        r"""
+        Return the x-slice sequence of the vertex `v`.
+
+        INPUT:
+
+        - ``v`` -- a vertex of the graph corresponding to the slice
+          decomposition.
+
+        OUTPUT:
+
+        A list of list corresponding to the x-slice sequence of ``v``.
+
+        EXAMPLES:
+
+        ::
+
+            sage: G = Graph('L~mpn~Nrv{^o~_').relabel('abcdefguvwxyz',inplace=False)
+            sage: SD = G.slice_decomposition(initial_vertex='x')
+            sage: SD.xslice_sequence('x')
+            [['x'], ['a', 'b', 'c', 'd', 'e', 'f', 'g'], ['u', 'y', 'z'], ['v', 'w']]
+            sage: SD.xslice_sequence('a')
+            [['a'], ['b', 'c', 'd', 'e', 'f'], ['g']]
+
+        The flatten x-slice sequence of a vertex corresponds to the slice of the
+        same vertex::
+
+            sage: from itertools import chain
+            sage: all(list(chain(*SD.xslice_sequence(v))) == SD.slice(v) \
+            ....:       for v in G)
+            True
+
+        The first list of the sequence is always a singleton containing the
+        input vertex::
+
+            sage: all(SD.xslice_sequence(v)[0] == [v] for v in G)
+            True
+
+        If the length of the slice if more than 1, the second list of the
+        sequence is either, all the remaining vertices of the slice of `v`, if
+        `v` is isolated in the subgraph induced by the slice of `v`, or the
+        neighbors of `v` in the subgraph induced by the slice of `v`::
+
+            sage: all(SD.xslice_sequence(v)[1] == SD.slice(v)[1:] for v in G \
+            ....:           if G.subgraph(SD.slice(v)).degree(v) == 0 \
+            ....:               and len(SD.slice(v)) > 1)
+            True
+            sage: for v in G:
+            ....:     if len(SD.slice(v)) > 1:
+            ....:         xslice_seq = SD.xslice_sequence(v)
+            ....:         S = G.subgraph(SD.slice(v))
+            ....:         if S.degree(v) > 0:
+            ....:             set(xslice_seq[1]) == set(S.neighbor_iterator(v))
+            True
+            True
+            True
+            True
+
+        TESTS::
+
+            sage: SD = graphs.PetersenGraph().slice_decomposition()
+            sage: SD.xslice_sequence('Terry')
+            Traceback (most recent call last):
+            ...
+            LookupError: vertex (Terry) does not appear in the slice decomposition
+        """
+        if v not in self.sigma_inv:
+            raise LookupError(f"vertex ({v}) does not appear in the slice "
+                              "decomposition")
+        cdef size_t i = self.sigma_inv[v]
+        return self._xslice_sequence(i)
+
+    def lexicographic_label(self, v):
+        r"""
+        Return the lexicographic label of the vertex `v`.
+
+        The lexicographic label of a vertex `v` is the list of all the
+        neighbors of `v` that appear before `v` in the lexBFS ordering
+        corresponding to the slice decomposition.
+
+        INPUT:
+
+        - ``v`` -- a vertex of the graph corresponding to the slice
+          decomposition.
+
+        OUTPUT:
+
+        A list of vertices.
+
+        EXAMPLES::
+
+            sage: G = Graph('L~mpn~Nrv{^o~_').relabel('abcdefguvwxyz',inplace=False)
+            sage: SD = G.slice_decomposition(initial_vertex='x')
+            sage: SD.lexicographic_label('f')
+            ['x', 'a', 'c', 'd']
+            sage: pos = lambda v: SD.lexBFS_order().index(v)
+            sage: set(SD.lexicographic_label('f')) \
+            ....:   == {v for v in G.neighbors('f') if pos(v) < pos('f')}
+            True
+
+        TESTS::
+
+            sage: SD = graphs.PetersenGraph().slice_decomposition()
+            sage: SD.lexicographic_label('Eric')
+            Traceback (most recent call last):
+            ...
+            LookupError: vertex (Eric) does not appear in the slice decomposition
+        """
+        if v not in self.sigma_inv:
+            raise LookupError(f"vertex ({v}) does not appear in the slice "
+                              "decomposition")
+        cdef size_t i = self.sigma_inv[v]
+        return self._xslice_lex_label(i)
+
+    def active_edges(self, v):
+        r"""
+        Return the active edges of the vertex `v`.
+
+        An edge `(u, w)` is said to be active for `v` if `u` and `w` belongs
+        to two differents slices of the x-slice sequence of `v`. Note that it
+        defines a partition of the edges of the underlying graph.
+
+        INPUT:
+
+        - ``v`` -- a vertex of the graph corresponding to the slice
+          decomposition.
+
+        OUTPUT:
+
+        A list of edges
+
+        EXAMPLES:
+
+        ::
+
+            sage: G = Graph('L~mpn~Nrv{^o~_').relabel('abcdefguvwxyz',inplace=False)
+            sage: SD = G.slice_decomposition(initial_vertex='x')
+            sage: SD.xslice_sequence('a')
+            [['a'], ['b', 'c', 'd', 'e', 'f'], ['g']]
+            sage: ('c', 'g') in SD.active_edges('a')
+            True
+            sage: ('a', 'c') in SD.active_edges('a')
+            True
+            sage: ('c', 'd') in SD.active_edges('a')  # c and d in same slice
+            False
+            sage: ('a', 'u') in SD.active_edges('a')  # u not in x-slice of a
+            False
+
+        The set of active edges of every vertex is a partition of the edges::
+
+            sage: from itertools import chain
+            sage: E = list(chain(*(SD.active_edges(v) for v in G)))
+            sage: G.size() == len(E) == len(set(E)) \
+            ....:   and all(G.has_edge(u, w) for v in G for u, w in SD.active_edges(v))
+            True
+
+        TESTS::
+
+            sage: SD = graphs.PetersenGraph().slice_decomposition()
+            sage: SD.active_edges('Graham')
+            Traceback (most recent call last):
+            ...
+            LookupError: vertex (Graham) does not appear in the slice decomposition
+        """
+        if v not in self.sigma_inv:
+            raise LookupError(f"vertex ({v}) does not appear in the slice "
+                              "decomposition")
+        cdef size_t i = self.sigma_inv[v]
+        return self._xslice_active_edges(i)
+
+    def _slice(self, size_t idx):
+        r"""
+        This method is for internal use only
+
+        TESTS:
+
+        Indirect doctests::
+
+            sage: SD = graphs.HouseGraph().slice_decomposition()
+            sage: SD.slice(1)
+            [1, 2]
+        """
+        return list(self.sigma[idx:idx+self.xslice_len[idx]])
+
+    def _xslice_sequence(self, size_t idx):
+        r"""
+        This method is for internal use only
+
+        TESTS:
+
+        Indirect doctests::
+
+            sage: SD = graphs.HouseGraph().slice_decomposition()
+            sage: SD.xslice_sequence(0)
+            [[0], [1, 2], [3], [4]]
+        """
+        cdef size_t l = self.xslice_len[idx]
+        cdef size_t j = idx + 1
+        cdef size_t lj
+
+        S = [ [self.sigma[idx]] ]
+        while j < idx + l:
+            lj = self.xslice_len[j]
+            S.append(list(self.sigma[j:j+lj]))
+            j += lj
+        assert j == idx + l, "slice decomposition is ill-formed"
+        return S
+
+    def _xslice_lex_label(self, size_t idx):
+        r"""
+        This method is for internal use only
+
+        TESTS:
+
+        Indirect doctests::
+
+            sage: SD = graphs.HouseGraph().slice_decomposition()
+            sage: SD.lexicographic_label(3)
+            [1, 2]
+        """
+        return list(self.lex_label[idx])
+
+    def _xslice_active_edges(self, size_t idx):
+        r"""
+        This method is for internal use only
+
+        TESTS:
+
+        Indirect doctests::
+
+            sage: SD = graphs.HouseGraph().slice_decomposition()
+            sage: SD.active_edges(0)
+            [(0, 1), (0, 2), (1, 3), (2, 3), (2, 4), (3, 4)]
+        """
+        cdef size_t l = self.xslice_len[idx]
+        cdef size_t llv_prefix = len(self.lex_label[idx])
+        cdef size_t j = idx + 1
+        cdef size_t lj
+
+        A = []
+        while j < idx + l:
+            lj = self.xslice_len[j]
+            llj = self.lex_label[j]
+            for u in self.sigma[j:j+lj]:
+                for w in llj[llv_prefix:]:
+                    A.append((w, u))
+            j += lj
+        assert j == idx + l, "slice decomposition is ill-formed"
+        return A
+
+    def underlying_graph(self):
+        r"""
+        Return the underlying graph corresponding to the slice decomposition.
+
+        If `G` was the graph given as parameter to compute the slice
+        decomposition, the underlying graph corresponds to ``G.to_simple()``
+        where labels are ignored, *i.e.*, it is the input graph without loops,
+        multiple edges and labels.
+
+        .. NOTE::
+
+            This method is mostly defined to test the computation of
+            lexicographic labels and actives edges.
+
+        EXAMPLES:
+
+        ::
+
+            sage: G = Graph('L~mpn~Nrv{^o~_').relabel('abcdefguvwxyz',inplace=False)
+            sage: SD = G.slice_decomposition(initial_vertex='x')
+            sage: SD.underlying_graph() == G
+            True
+
+        The graph can have loops or multiple edges but they are ignored::
+
+            sage: G = graphs.CubeConnectedCycle(2)  # multiple edges
+            sage: SD = G.slice_decomposition()
+            sage: SD.underlying_graph() == G.to_simple(immutable=True)
+            True
+
+            sage: G = graphs.CubeConnectedCycle(1)  # loops
+            sage: SD = G.slice_decomposition()
+            sage: SD.underlying_graph() == G.to_simple(immutable=True)
+            True
+
+        TESTS::
+
+            sage: for _ in range(5):
+            ....:   G = graphs.RandomGNP(15, 0.3)
+            ....:   SD = G.slice_decomposition()
+            ....:   SD.underlying_graph() == G
+            True
+            True
+            True
+            True
+            True
+        """
+        if not hasattr(self, '_underlying_graph'):
+            vertices = self.sigma
+            edges = [(u, v) for i, v in enumerate(self.sigma)
+                            for u in self.lex_label[i]]
+            data = [vertices, edges]
+            Gclass = self._graph_class
+            self._underlying_graph = Gclass(data, format='vertices_and_edges',
+                                            immutable=True)
+        return self._underlying_graph
+
+    def _repr_(self):
+        r"""
+        Return a string representation of a ``SliceDecomposition`` object.
+
+        TESTS::
+
+            sage: G = graphs.PetersenGraph(); SD = G.slice_decomposition()
+            sage: repr(SD)
+            '[0[1[4[5]]] [2[6]] [3] [9] [7] [8]]'
+            sage: G = Graph('L~mpn~Nrv{^o~_').relabel('abcdefguvwxyz',inplace=False)
+            sage: SD = G.slice_decomposition(initial_vertex='x'); repr(SD)
+            '[x[a[b[c[d]] [e[f]]] [g]] [u[y[z]]] [v[w]]]'
+        """
+        def inner_repr(idx):
+            l = self.xslice_len[idx]
+            S = []
+            if l > 1:
+                j = idx + 1
+                while j < idx + l:
+                    lj = self.xslice_len[j]
+                    S.append(inner_repr(j))
+                    j += lj
+                assert j == idx + l, "slice decomposition is ill-formed"
+            return f'{self.sigma[idx]}' + ' '.join(f'[{s}]' for s in S)
+        return f'[{inner_repr(0)}]'
+
+    def _latex_(self):
+        r"""
+        Return a string to render, using `\LaTeX`, the slice decomposition as a
+        tree.
+
+        TESTS::
+
+            sage: from sage.graphs.graph_latex import check_tkz_graph
+            sage: check_tkz_graph()  # random - depends on Tex installation
+            sage: G = graphs.PetersenGraph(); SD = G.slice_decomposition()
+            sage: latex(SD)
+            \begin{tikzpicture}
+            ...
+              v0 -- {l0, v1, v4, v6, v7, v8, v9};
+              v1 -- {l1, v2};
+              v2 -- {l2, v3};
+              v3 -- {l3};
+              v4 -- {l4, v5};
+              v5 -- {l5};
+              v6 -- {l6};
+              v7 -- {l7};
+              v8 -- {l8};
+              v9 -- {l9};
+            ...
+            \end{tikzpicture}
+
+        """
+        from sage.misc.latex import latex
+
+        latex.add_package_to_preamble_if_available("tikz")
+        latex.add_to_preamble(r"\usetikzlibrary{arrows,shapes,fit}")
+        latex.add_to_preamble(r"\usetikzlibrary{graphs,graphdrawing}")
+        latex.add_to_preamble(r"\usegdlibrary{trees}")
+
+        # Call latex() on all vertices
+        sigma_latex = [ latex(v) for v in self.sigma ]
+        slices = [[] for _ in self.sigma]
+
+        lines = [ r"\begin{tikzpicture}" ]
+        lines.append(r"\graph [tree layout,level distance=0,level sep=1em,"
+                     r"sibling distance=0,sibling sep=0.6em,"
+                     r"tail anchor=center,head anchor=north,"
+                     r"nodes={draw,rectangle,inner xsep=0.2em},edges={thick}]")
+        lines.append("{")
+        bo, bc = "{", "}"  # to write { and } in f-strings
+        # Create the nodes and leaves of the slice decomposition tree
+        for i in range(len(self.sigma)):
+            l = self.xslice_len[i]
+            label = r"\ ".join(sigma_latex[i:i+l])
+            lines.append(f"  v{i}[as={bo}${label}${bc}];")
+            lines.append(f"  l{i}[draw=none,as={bo}${sigma_latex[i]}${bc}];")
+            j = i + 1
+            slices[i].append(f"l{i}")
+            while j < i + l:
+                slices[i].append(f"v{j}")
+                j += self.xslice_len[j]
+        # Create the edges of the slice decomposition tree
+        for i, S in enumerate(slices):
+            lines.append(f"  v{i} -- " + "{" + ", ".join(S) + "};")
+        lines.append("};")
+        # Add dahsed red boxes around xslices
+        for i, S in enumerate(slices):
+            fit=" ".join(f"({s})" for s in S)
+            lines.append(rf"\node (s{i}) [rectangle,inner xsep=0.2em,draw=red,"
+                         f"densely dashed,fit={fit}]{bo}{bc};")
+
+        lines.append(r"\end{tikzpicture}")
+        return "\n".join(lines)
+# End: Copy from code from PR#38299
+
+
+cdef void _mark_partitive_forest_one_set(
+        const int *lex_label_ptr, size_t l,
+        const unordered_map[int, md_tree_node *] &leaves):
+    cdef unordered_set[md_tree_node *] Marked
+    cdef unordered_set[md_tree_node *] Full
+    cdef queue[md_tree_node *] Explore
+    # temporary variables
+    cdef size_t i
+    cdef int t
+    cdef md_tree_node *n
+    cdef md_tree_node *p
+    cdef md_tree_node *c
+    cdef vector[md_tree_node *] *C
+    cdef unordered_map[int, md_tree_node *].const_iterator it
+    cdef bint b
+    cdef size_t nA, nB
+    cdef md_tree_node *newnodeA
+    cdef md_tree_node *newnodeB
+    cdef md_tree_node *lastA
+    cdef md_tree_node *lastB
+
+    for i in range(l):
+        it = leaves.find(lex_label_ptr[i])
+        assert it != leaves.end(), f'unknown leaf {lex_label_ptr[i]}'
+        Explore.push(deref(it).second)
+
+    while Explore.size() > 0:
+        n = Explore.front()
+        Explore.pop()
+        p = deref(n).parent
+        Full.insert(n)
+        if deref(n).label == EMPTY:
+            deref(n).label = HOMOGENEOUS
+        if p != NULL:
+            Marked.insert(p)
+            # if all descendants of p are in Full, move p from Marked to Explore
+            b = True
+            for c in deref(p).children:
+                if Full.find(c) == Full.end():
+                    b = False
+                    break
+            if b:
+                Marked.erase(p)
+                Explore.push(p)
+
+    for n in Marked:
+        # If n is SERIES or PARALLEL => gather children of n in Full below the
+        # same new node A (needed only if there are >= 2 such children) and the
+        # children of n not in Full below the same new node B (needed only if
+        # there is >= 2 such children)
+        C = address(deref(n).children)
+        if deref(n).is_degenerate():
+            t = deref(n).type
+            lastA = NULL
+            lastB = NULL
+            newnodeA = NULL
+            newnodeB = NULL
+            nA, nB = 0, 0
+            for c in deref(C):
+                if Full.find(c) != Full.end():
+                    nA += 1
+                    lastA = c
+                else:
+                    nB += 1
+                    lastB = c
+            if nA >= 2 or nB >= 2:
+                if nA >= 2:
+                    newnodeA = new md_tree_node(n, nA, t, HOMOGENEOUS, FLAGs,
+                                                SIZE_MAX)
+                if nB >= 2:
+                    newnodeB = new md_tree_node(n, nB, t, EMPTY, FLAGo,
+                                                SIZE_MAX)
+                for c in deref(C):
+                    if Full.find(c) != Full.end():
+                        if newnodeA != NULL:
+                            deref(newnodeA).append_new_child(c)
+                    else:
+                        if newnodeB != NULL:
+                            deref(newnodeB).append_new_child(c)
+                deref(C).clear()
+                if newnodeA != NULL:
+                    deref(C).push_back(newnodeA)
+                elif lastA != NULL:
+                    deref(C).push_back(lastA)
+                if newnodeB != NULL:
+                    deref(C).push_back(newnodeB)
+                elif lastB != NULL:
+                    deref(C).push_back(lastB)
+
+        if deref(n).label != DEAD:
+            deref(n).label = DEAD
+            # Set flag to * for children of n that are in Full
+            for c in deref(C):
+                if Full.find(c) != Full.end():
+                    deref(c).flag = FLAGs
+
+cdef void _mark_partitive_forest_finish(md_tree_node *n):
+    cdef size_t nb_homogeneous_or_empty = 0
+    cdef md_tree_node *c
+    cdef md_tree_node *parent
+    cdef md_tree_node *newnodeA
+    cdef size_t i, nn
+
+    cdef vector[md_tree_node *] *C = address(deref(n).children)
+
+    # Do a postorder visit: so we first visit the children
+    for c in deref(C):
+        _mark_partitive_forest_finish(c)
+        if deref(c).is_homogeneous_or_empty():
+            nb_homogeneous_or_empty += 1
+
+    # Then we do the actual work on the current node
+    if deref(n).is_dead_or_broken():
+        parent = deref(n).parent
+        if parent != NULL and deref(parent).label != DEAD:
+            deref(parent).label = BROKEN
+        if deref(n).label == BROKEN and deref(n).is_degenerate() \
+                       and nb_homogeneous_or_empty > 1:
+            newnodeA = new md_tree_node(n, nb_homogeneous_or_empty,
+                                        deref(n).type, EMPTY, FLAGo, SIZE_MAX)
+
+            # Iterate over the children
+            i = 0
+            nn = deref(C).size()
+            while i < nn:
+                c = deref(C)[i]
+                if deref(c).is_homogeneous_or_empty():  # swap at the end
+                    nn -= 1
+                    deref(C)[i], deref(C)[nn] = deref(C)[nn], deref(C)[i]
+                    deref(newnodeA).append_new_child(c)
+                else:
+                    i += 1
+            deref(C).resize(nn)
+            deref(C).push_back(newnodeA)
+
+cdef void _sort_dead_rec (md_tree_node *n, bint first_slice):
+    cdef md_tree_node *c
+    cdef vector[md_tree_node *] *C = address(deref(n).children)
+    cdef size_t i, b
+
+    if deref(n).is_dead_or_broken():
+        # If the label is EMPTY or HOMOGENEOUS no need to go deeper: they will
+        # not be any DEAD or BROKEN nodes
+        for c in deref(n).children:
+            _sort_dead_rec(c, first_slice)
+
+    if deref(n).label == DEAD:
+        # if first_slice is True => put children with FLAGs at the beginning
+        # if first_slice is False => put children with FLAGo at the beginning
+        # => children such that first_slice != (flag == FLAGo) should be put at
+        # the beginning
+        b = 0
+        i = 0
+        for i in range(deref(C).size()):
+            if first_slice != (deref(C)[i].flag == FLAGo):
+                if b != i:  # no need to swap if same item
+                    deref(C)[i], deref(C)[b] = deref(C)[b], deref(C)[i]
+                preincrement(b)
+            preincrement(i)
+
+cdef void _sort_broken_rec (md_tree_node *n, bint first_slice):
+    cdef md_tree_node *c
+    cdef vector[md_tree_node *] *C = address(deref(n).children)
+    cdef size_t i, b
+
+    if deref(n).is_dead_or_broken():
+        # If the label is not DEAD or BROKEN, no need to go deeper: they will
+        # not be any DEAD or BROKEN nodes
+        for c in deref(C):
+            _sort_broken_rec(c, first_slice)
+
+    if deref(n).label == BROKEN:
+        # if first_slice is True => put children with DEAD and BROKEN at the
+        # beginning
+        # if first_slice is False => put children with EMPTY or HOMOGENEOUS at
+        # the beginning
+        # => children such that first_slice != (label == EMPTY or HOMOGENEOUS)
+        # should be put at the beginning
+        b = 0
+        i = 0
+        for i in range(deref(C).size()):
+            if first_slice != deref(deref(C)[i]).is_homogeneous_or_empty():
+                if b != i:  # no need to swap if same item
+                    deref(C)[i], deref(C)[b] = deref(C)[b], deref(C)[i]
+                preincrement(b)
+            preincrement(i)
+
+cdef void _extract_and_sort(MDForest md, bint first_slice):
+    cdef cpplist[md_tree_node *].iterator it = md.roots.begin()
+    cdef md_tree_node *r
+    cdef md_tree_node *c
+    cdef size_t i
+    cdef size_t cc
+
+    # sort children of DEAD nodes
+    for r in md.roots:
+        _sort_dead_rec(r, first_slice)
+
+    # sort children of BROKEN nodes
+    for r in md.roots:
+        _sort_broken_rec(r, first_slice)
+
+    # remove DEAD and BROKEN nodes
+    while it != md.roots.end():
+        r = deref(it)
+        cc = deref(r).slice_or_cc_tag
+        if deref(r).is_dead_or_broken():
+            it = md.roots.erase(it)
+            for i in reversed(range(deref(r).children.size())):
+                c = deref(r).children[i]
+                if cc != SIZE_MAX:  # propagate cc tag if set
+                    c.slice_or_cc_tag = cc
+                it = md.roots.insert(it, c)
+                deref(c).parent = NULL
+            del r
+        else:
+            preincrement(it)
+
+ctypedef pair[md_tree_node_ptr, md_tree_node_ptr] module_t
+
+cdef bint _are_cluster_non_adjacent(
+        CGraph cg, vector[vector[module_t]] &clusters,
+        size_t i, size_t j):
+
+    cdef module_t mi, mj
+    cdef int vi
+
+    for mi in clusters[i]:
+        vi = deref(mi.second).type
+        for mj in clusters[j]:
+            if cg.has_arc_unsafe(vi, deref(mj.second).type):
+                return False
+    return True
+
+cdef struct _scratch_data:
+    vector[vector[module_t]] clusters
+    vector[size_t] Left
+    vector[size_t] Right
+    unordered_map[int, size_t] cluster_of_v
+
+cdef MDForest corneil_habib_paul_tedder_inner(
+        CGraph cg, const slice_decomposition &SD,
+        unordered_map[int, md_tree_node *] &leaves,
+        _scratch_data &scratch):
+    r"""
+    """
+    cdef MDForest MD = MDForest()
+
+    if SD.length == 0:  # empty graph
+        return MD
+
+    cdef slice_decomposition subSD
+
+    cdef list MDi = []
+    cdef int x = SD.sigma[0]
+    cdef size_t first_of_last_slice
+    cdef size_t nslices, slice_idx, prev_slice_idx, target_slice
+    # temporary variables
+    cdef size_t l, i, j, k, s, p, q, lp, rp, r, old_l, old_r, prev, cc, prev_cc
+    cdef bool first, adj
+    cdef module_t m
+    cdef md_tree_node *n
+    cdef md_tree_node *c
+    cdef md_tree_node *root
+    cdef int y, t, v
+    cdef const int* lex_label_ptr
+    cdef MDForest md
+
+    if SD.length == 1:
+        leaves[x] = MD.add(x)
+    elif SD.length == 2:
+        y = SD.sigma[1]
+        # root is SERIES if there is an edge between x and y, else PARALLEL
+        t = SERIES if SD_lex_label_size(SD, 1) > 0 else PARALLEL
+        root = MD.add(t, parent=NULL, nchildren_expected=2)
+        leaves[x] = MD.add(x, root)
+        leaves[y] = MD.add(y, root)
+    else:
+        i = 1
+        while i < SD.length:
+            first_of_last_slice = i
+            l = SD.xslice_len[i]
+            # create the subslice (change offsets and length)
+            subSD = slice_decomposition(l, SD.lex_label[i].size(), SD.sigma + i,
+                                        SD.xslice_len + i, SD.lex_label + i)
+            md = corneil_habib_paul_tedder_inner (cg, subSD, leaves, scratch)
+            md.set_label_and_flag(EMPTY, FLAGo)
+            MDi.append(md)
+            i += l
+        assert i == SD.length, "slice decomposition is ill-formed"
+        nslices = len(MDi)+1  # {x} is also a slice but was not added in MDi
+
+        # If G is not connected, the last slice is all the connected components
+        # that do not contains x
+        is_connected = SD_lex_label_size(SD, first_of_last_slice) > 0
+
+        # x is isolated if it has no neighbor, i.e., if lex_labels[1] is empty
+        x_is_isolated = SD_lex_label_size(SD, 1) == 0
+
+        if x_is_isolated:
+            md = MDi[0]
+            if md.roots.front().type == PARALLEL:
+                swap(MD.roots, md.roots)
+                leaves[x] = MD.add(x, MD.roots.front())
+            else:
+                root = MD.add(PARALLEL)
+                leaves[x] = MD.add(x, root)
+                c = md.roots.front()
+                deref(root).append_new_child(c)
+                md.roots.clear()
+        else:
+            # Preprocessing for connected (co-)components of slices (for
+            # clusters computation)
+            for i, md in enumerate(MDi):
+                md.set_connected_components_tag(i == 0)
+
+            i = 1
+            first = True
+            while i < SD.length:
+                if not first:
+                    if (l := SD_lex_label_size(SD, i)) > 0:
+                        lex_label_ptr = SD.lex_label[i].data() + SD.lex_label_offset
+                        _mark_partitive_forest_one_set(lex_label_ptr, l, leaves)
+                first = False
+                i += SD.xslice_len[i]
+
+            scratch.clusters.clear()
+            scratch.cluster_of_v.clear()
+            for i, md in enumerate(MDi):
+                for n in md.roots:
+                    _mark_partitive_forest_finish(n)
+                _extract_and_sort(md, i==0)
+
+                # Postprocessing for connected (co-)components of slices (for
+                # clusters computation)
+                prev_cc = SIZE_MAX
+                for n in md.roots:
+                    cc = n.slice_or_cc_tag
+                    # compute left-most descendant
+                    c = n
+                    while deref(c).children.size() > 0:
+                        c = deref(c).children[0]
+                    v = deref(c).type
+
+                    # temporarily store the slice index in the cc_tag
+                    deref(n).slice_or_cc_tag = i
+                    if cc == SIZE_MAX:  # n is alone in the cluster
+                        scratch.clusters.emplace_back(1, module_t(n, c))  # new cluster
+                        prev_cc = SIZE_MAX
+                    else:
+                        if cc != prev_cc:
+                            scratch.clusters.emplace_back()  # start new cluster
+                        scratch.clusters.back().emplace_back(n, c)
+                        prev_cc = cc
+
+                    scratch.cluster_of_v[v] = scratch.clusters.size()-1
+
+                if i == 0:  # "cluster" containing only x
+                    p = scratch.clusters.size()
+                    leaves[x] = MD.add(x)
+                    scratch.clusters.emplace_back(1, module_t(leaves[x], leaves[x]))
+
+            q = scratch.clusters.size()-1
+
+            # Left computation:
+            #   Left(j) == j if j <= p
+            #   Left(j) == Left(k) for p < j,k if Kj Kk in same slice
+            i, s = 1, 0
+            scratch.Left.clear()
+            scratch.Left.reserve(scratch.clusters.size())
+            while i < SD.length:
+                if s == 0:  # first slice
+                    for j in range(p+1):
+                        scratch.Left.push_back(j)
+                    k = p+1
+                else:
+                    v = SD.sigma[i]
+                    lp = 0  # lp will be the Left for all clusters of the slice
+                    while lp < p:
+                        adj = True
+                        for m in scratch.clusters[lp]:
+                            if not cg.has_arc_unsafe (deref(m.second).type, v):
+                                adj = False
+                                break
+                        if not adj:  # we have found the correct lp
+                            break
+                        lp += 1
+                    while k < scratch.clusters.size() and deref(scratch.clusters[k].front().first).slice_or_cc_tag == s:
+                        scratch.Left.push_back(lp)
+                        k += 1
+                i += SD.xslice_len[i]
+                s += 1
+
+            # Right computation
+            scratch.Right.clear()
+            scratch.Right.reserve(scratch.clusters.size())
+            scratch.Right.resize(p+1, p);
+            for i in range(p+1, q+1):
+                scratch.Right.push_back(i)
+
+            i, s, j = 1, 0, 0
+            while i < SD.length:
+                # Compute j the highest index of a cluster of slice i
+                while j+1 < scratch.clusters.size() and deref(scratch.clusters[j+1].front().first).slice_or_cc_tag == s:
+                    j += 1
+                # Iterate over the lexicographic labels of the slice
+                if s > 0:  # not the first slice
+                    for v in SD.lex_label[i][SD.lex_label_offset:]:
+                        if scratch.cluster_of_v.find(v) != scratch.cluster_of_v.end():
+                            scratch.Right[scratch.cluster_of_v[v]]= j
+                else:
+                    j += 1  # skip "cluster" {x}
+                i += SD.xslice_len[i]
+                s += 1
+
+            # Parse and assemble
+            l = r = p
+            while l > 0 or r < q:
+                old_l, old_r = l, r
+                if r == q or (l > 0 \
+                        and _are_cluster_non_adjacent(cg, scratch.clusters, l-1, r+1)):
+                    lp, rp = l-1, r
+                    t = SERIES
+                else:
+                    lp, rp = l, r+1
+                    t = PARALLEL
+
+                while lp < l or r < rp:
+                    if lp < l:
+                        i = l = l-1
+                    else:
+                        i = r = r+1
+                    lp = min(lp, scratch.Left[i])
+                    rp = max(rp, scratch.Right[i])
+
+                t = PRIME if (r-l)-(old_r-old_l) > 1 else t
+                root = MD.add(t)
+
+                for i in chain(range(l, old_l), range(old_r, r+1)):
+                    if i == old_r:  # add the old root
+                        n = MD.roots.front()  # old root
+                        MD.roots.pop_front()
+                        deref(root).append_new_child(n)
+                    else:
+                        for m in scratch.clusters[i]:
+                            n = m.first
+                            if t != PRIME and deref(n).type == t:
+                                for c in deref(n).children:
+                                    deref(root).append_new_child(c)
+                            else:
+                                deref(root).append_new_child(n)
+
+            for md in MDi:
+                md.roots.clear()
+
+    return MD
+
+
+def corneil_habib_paul_tedder_algorithm(G):
+    if G.is_directed():
+        raise ValueError("Graph must be undirected")
+
+    cdef CGraphBackend Gbackend = <CGraphBackend> G._backend
+    cdef CGraph cg = Gbackend.cg()
+
+    cdef vector[int] sigma
+    cdef vector[vector[int]] lex_label
+    cdef vector[size_t] xslice_len
+
+    # Compute the slice decomposition using the extended lexBFS algorithm
+    extended_lex_BFS(cg, sigma, NULL, -1, NULL, &xslice_len, &lex_label)
+
+    cdef slice_decomposition SD = slice_decomposition(cg.num_verts, 0,
+                                                      sigma.data(),
+                                                      xslice_len.data(),
+                                                      lex_label.data())
+
+    cdef unordered_map[int, md_tree_node *] leaves
+    cdef _scratch_data scratch
+
+    MD = corneil_habib_paul_tedder_inner(cg, SD, leaves, scratch)
+    return MD.to_md_tree(Gbackend)
+
+cdef _Node_latex_inner_rec(self, size_t i, dict nodes, list edges, dict levels):
+    from sage.misc.latex import latex
+    cdef size_t j = i+1, level = 0, l
+
+    bo, bc = "{", "}"  # to write { and } in f-strings
+    if self.node_type == NodeType.NORMAL:
+        nodes[f"v{i}"] = f"  v{i}[as={bo}${latex(self.children[0])}${bc}];"
+    else:
+        label = str(self.node_type).title()
+        nodes[f"v{i}"] = f"  v{i}[draw=none,as={bo}{latex(label)}{bc}];"
+        C = []
+        for c in self.children:
+            C.append(f"v{j}")
+            j, l = _Node_latex_inner_rec(c, j, nodes, edges, levels)
+            level = max(level, l+1)
+        edges.append(f"  v{i} -- " + "{" + ", ".join(C) + "};")
+    if level not in levels:
+        levels[level] = []
+    levels[level].append(f"v{i}")
+    return j, level
+
+
+def _Node_latex_(self):
+    from sage.misc.latex import latex
+
+    latex.add_package_to_preamble_if_available("tikz")
+    latex.add_to_preamble(r"\usetikzlibrary{arrows,shapes,fit}")
+    latex.add_to_preamble(r"\usetikzlibrary{graphs,graphdrawing}")
+    latex.add_to_preamble(r"\usegdlibrary{layered}")
+
+    # https://tikz.dev/gd-layered
+    lines = [ r"\begin{tikzpicture}" ]
+    lines.append(r"\graph [layered layout,"
+                 r"tail anchor=center,head anchor=north,"
+                 r"edges=rounded corners,"
+                 r"nodes={draw=none}]")
+    lines.append("{")
+    nodes = {}
+    edges = []
+    levels = {}
+    _Node_latex_inner_rec(self, 0, nodes, edges, levels)
+    for l in reversed(sorted(levels)):
+        lines.extend(nodes[v] for v in levels[l])
+        lines.append("  { [same layer] " + ", ".join(levels[l]) + " };")
+    lines.extend(edges)
+    lines.append("};")
+    lines.append(r"\end{tikzpicture}")
+    return "\n".join(lines)
+
+Node._latex_ = _Node_latex_

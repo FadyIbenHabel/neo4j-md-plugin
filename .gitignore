@@ -1,20 +1,42 @@
-cat > .gitignore <<'EOF'
-# Gradle
+# Build / Gradle
 .gradle/
 build/
+bin/
 
-# IntelliJ / VSCode
+# IDEs
 .idea/
 *.iml
 .vscode/
 
 # OS
 .DS_Store
+Thumbs.db
 
 # Logs
 *.log
 
-# Neo4j / local files
+# Neo4j local runtime
 data/
 plugins/
-EOF
+import/
+logs/
+
+# Python / Sage / Cython
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.c
+*.cpp
+
+# Sage / Cython build artifacts
+.sage/
+.sage_cache/
+*.sage.py
+*.spyx.c
+*.pyx.c
+
+# Temporary files
+tmp/
+temp/

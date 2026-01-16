@@ -1,6 +1,9 @@
 package org.example.md;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.neo4j.graphdb.Direction;
 import org.neo4j.graphdb.Label;
 import org.neo4j.graphdb.Node;
@@ -9,88 +12,273 @@ import org.neo4j.graphdb.RelationshipType;
 import org.neo4j.graphdb.ResourceIterator;
 import org.neo4j.graphdb.Transaction;
 import org.neo4j.procedure.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
-import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
+/**
+ * Neo4j procedures for computing modular decomposition of graphs.
+ *
+ * <p>This implementation uses a pure Java version of the Corneil-Habib-Paul-Tedder
+ * algorithm, ensuring all computation happens within Neo4j without external dependencies.</p>
+ *
+ * <h2>Usage:</h2>
+ * <pre>
+ * CALL md.compute('NodeLabel', 'RELATIONSHIP_TYPE')
+ * YIELD treeJson, nodeCount, edgeCount, nodeMapping
+ * </pre>
+ *
+ * <h2>Configuration:</h2>
+ * <ul>
+ *   <li>maxNodes - Maximum number of nodes to process (default: 100,000)</li>
+ *   <li>timeoutMs - Timeout in milliseconds (default: 300,000 = 5 minutes)</li>
+ * </ul>
+ *
+ * @see ModularDecomposition
+ */
 public class ModularDecompositionProcedures {
+
+    private static final Logger log = LoggerFactory.getLogger(ModularDecompositionProcedures.class);
+
+    /** Default maximum number of nodes to process */
+    public static final int DEFAULT_MAX_NODES = 100_000;
+
+    /** Default timeout in milliseconds (5 minutes) */
+    public static final long DEFAULT_TIMEOUT_MS = 300_000;
+
+    /** Jackson ObjectMapper for JSON serialization */
+    private static final ObjectMapper objectMapper = new ObjectMapper();
 
     @Context
     public Transaction tx;
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-
+    /**
+     * Result class for the modular decomposition procedure.
+     *
+     * <p>Contains the decomposition tree as JSON, node/edge counts, and a mapping
+     * from internal indices back to original Neo4j node IDs.</p>
+     */
     public static class MdResult {
+        /** JSON representation of the complete result including the MD tree */
         public String treeJson;
+
+        /** Number of nodes in the processed subgraph */
         public long nodeCount;
+
+        /** Number of edges in the processed subgraph */
         public long edgeCount;
 
-        public MdResult(String treeJson, long nodeCount, long edgeCount) {
+        /** JSON mapping from internal vertex indices to Neo4j element IDs */
+        public String nodeMapping;
+
+        /** Execution time in milliseconds */
+        public long executionTimeMs;
+
+        public MdResult(String treeJson, long nodeCount, long edgeCount,
+                       String nodeMapping, long executionTimeMs) {
             this.treeJson = treeJson;
             this.nodeCount = nodeCount;
             this.edgeCount = edgeCount;
+            this.nodeMapping = nodeMapping;
+            this.executionTimeMs = executionTimeMs;
         }
     }
 
+    /**
+     * Compute modular decomposition of a subgraph with default settings.
+     *
+     * @param label The node label to filter nodes (required, non-empty)
+     * @param relType The relationship type to consider (required, non-empty)
+     * @return Stream of MdResult containing the decomposition tree as JSON
+     * @throws IllegalArgumentException if label or relType is null or empty
+     * @throws RuntimeException if graph exceeds size limit or computation times out
+     *
+     * @see #computeWithConfig(String, String, Long, Long)
+     */
     @Procedure(name = "md.compute", mode = Mode.READ)
-    @Description("CALL md.compute(label, relType) YIELD treeJson, nodeCount, edgeCount")
+    @Description("CALL md.compute(label, relType) YIELD treeJson, nodeCount, edgeCount, nodeMapping, executionTimeMs - " +
+                 "Computes the modular decomposition tree of the specified subgraph")
     public Stream<MdResult> compute(
             @Name("label") String label,
             @Name("relType") String relType
     ) {
+        return computeWithConfig(label, relType, null, null);
+    }
+
+    /**
+     * Compute modular decomposition with custom configuration.
+     *
+     * @param label The node label to filter nodes (required, non-empty)
+     * @param relType The relationship type to consider (required, non-empty)
+     * @param maxNodes Maximum number of nodes to process (null for default)
+     * @param timeoutMs Timeout in milliseconds (null for default)
+     * @return Stream of MdResult containing the decomposition tree as JSON
+     */
+    @Procedure(name = "md.computeWithConfig", mode = Mode.READ)
+    @Description("CALL md.computeWithConfig(label, relType, maxNodes, timeoutMs) - " +
+                 "Computes modular decomposition with custom size limit and timeout")
+    public Stream<MdResult> computeWithConfig(
+            @Name("label") String label,
+            @Name("relType") String relType,
+            @Name(value = "maxNodes", defaultValue = "null") Long maxNodes,
+            @Name(value = "timeoutMs", defaultValue = "null") Long timeoutMs
+    ) {
+        long startTime = System.currentTimeMillis();
+
+        // Input validation
+        validateInput(label, "label");
+        validateInput(relType, "relType");
+
+        int effectiveMaxNodes = maxNodes != null ? maxNodes.intValue() : DEFAULT_MAX_NODES;
+        long effectiveTimeoutMs = timeoutMs != null ? timeoutMs : DEFAULT_TIMEOUT_MS;
+
+        log.info("Starting md.compute for label='{}', relType='{}', maxNodes={}, timeoutMs={}",
+                label, relType, effectiveMaxNodes, effectiveTimeoutMs);
+
         try {
-            GraphExtract extract = extractUndirectedSubgraph(label, relType);
-            String resultJson = runSageModularDecomposition(extract);
-            return Stream.of(new MdResult(resultJson, extract.n, extract.edges.size()));
+            // Extract the subgraph from Neo4j
+            GraphExtract extract = extractUndirectedSubgraph(label, relType, effectiveMaxNodes);
+
+            log.debug("Extracted {} nodes and {} edges", extract.n, extract.edges.size());
+
+            // Check timeout before computation
+            checkTimeout(startTime, effectiveTimeoutMs, "graph extraction");
+
+            // Build the graph data structure
+            Graph graph = new Graph(extract.n);
+            for (int[] edge : extract.edges) {
+                graph.addEdge(edge[0], edge[1]);
+            }
+
+            // Check timeout before main computation
+            checkTimeout(startTime, effectiveTimeoutMs, "graph building");
+
+            // Compute modular decomposition
+            MDNode tree = ModularDecomposition.compute(graph);
+
+            // Check timeout after computation
+            checkTimeout(startTime, effectiveTimeoutMs, "decomposition computation");
+
+            long executionTime = System.currentTimeMillis() - startTime;
+            log.info("Completed md.compute in {}ms for {} nodes, {} edges",
+                    executionTime, extract.n, extract.edges.size());
+
+            // Build result JSON
+            String treeJson = buildResultJson(tree, extract.n, extract.edges.size());
+            String mappingJson = buildMappingJson(extract.idMapping);
+
+            return Stream.of(new MdResult(
+                    treeJson,
+                    extract.n,
+                    extract.edges.size(),
+                    mappingJson,
+                    executionTime
+            ));
+
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            log.error("Validation error in md.compute: {}", e.getMessage());
+            throw e;
         } catch (Exception e) {
+            log.error("Error in md.compute: {}", e.getMessage(), e);
             throw new RuntimeException("md.compute failed: " + e.getMessage(), e);
         }
     }
 
-    // Graph extraction from Neo4j
-    private static final class GraphExtract {
-        final int n;
-        final List<int[]> edges; // each {u,v} with u<v
-
-        GraphExtract(int n, List<int[]> edges) {
-            this.n = n;
-            this.edges = edges;
+    /**
+     * Validate that a required string parameter is not null or empty.
+     */
+    private void validateInput(String value, String paramName) {
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    String.format("Parameter '%s' is required and cannot be null or empty", paramName));
         }
     }
 
-    private GraphExtract extractUndirectedSubgraph(String label, String relType) {
+    /**
+     * Check if the operation has exceeded the timeout.
+     */
+    private void checkTimeout(long startTime, long timeoutMs, String phase) {
+        long elapsed = System.currentTimeMillis() - startTime;
+        if (elapsed > timeoutMs) {
+            throw new IllegalStateException(String.format(
+                    "Operation timed out after %dms during %s (limit: %dms)",
+                    elapsed, phase, timeoutMs));
+        }
+    }
+
+    /**
+     * Internal class to hold extracted graph data with ID mapping.
+     */
+    private static class GraphExtract {
+        /** Number of vertices */
+        final int n;
+
+        /** List of edges, each as {u, v} where u < v */
+        final List<int[]> edges;
+
+        /** Mapping from internal index to Neo4j element ID */
+        final Map<Integer, String> idMapping;
+
+        GraphExtract(int n, List<int[]> edges, Map<Integer, String> idMapping) {
+            this.n = n;
+            this.edges = edges;
+            this.idMapping = idMapping;
+        }
+    }
+
+    /**
+     * Extract an undirected subgraph from Neo4j based on label and relationship type.
+     *
+     * @param label Node label to filter
+     * @param relType Relationship type to consider
+     * @param maxNodes Maximum number of nodes allowed
+     * @return GraphExtract containing the graph structure and ID mappings
+     * @throws IllegalStateException if node count exceeds maxNodes
+     */
+    private GraphExtract extractUndirectedSubgraph(String label, String relType, int maxNodes) {
         Label L = Label.label(label);
         RelationshipType R = RelationshipType.withName(relType);
 
-        // 1) Collect nodes with that label
+        // Collect nodes with that label
         List<Node> nodes = new ArrayList<>();
         try (ResourceIterator<Node> it = tx.findNodes(L)) {
-            while (it.hasNext()) nodes.add(it.next());
+            while (it.hasNext()) {
+                if (nodes.size() >= maxNodes) {
+                    throw new IllegalStateException(String.format(
+                            "Graph exceeds maximum node limit of %d. " +
+                            "Use md.computeWithConfig() with a higher maxNodes parameter or filter your data.",
+                            maxNodes));
+                }
+                nodes.add(it.next());
+            }
         }
 
-        // Map Neo4j node id -> index 0..n-1
-        Map<Long, Integer> idToIdx = new HashMap<>(nodes.size() * 2);
+        // Map Neo4j element ID -> index 0..n-1
+        // Also build reverse mapping for result
+        Map<String, Integer> elementIdToIdx = new HashMap<>(nodes.size() * 2);
+        Map<Integer, String> idxToElementId = new HashMap<>(nodes.size() * 2);
+
         for (int i = 0; i < nodes.size(); i++) {
-            idToIdx.put(nodes.get(i).getId(), i);
+            String elementId = nodes.get(i).getElementId();
+            elementIdToIdx.put(elementId, i);
+            idxToElementId.put(i, elementId);
         }
 
-        // 2) Collect undirected edges among selected nodes
+        // Collect undirected edges among selected nodes
         // Use a long key (minIdx, maxIdx) to deduplicate
         Set<Long> edgeKeys = new HashSet<>();
         for (Node u : nodes) {
-            int ui = idToIdx.get(u.getId());
+            int ui = elementIdToIdx.get(u.getElementId());
             for (Relationship rel : u.getRelationships(Direction.BOTH, R)) {
                 Node v = rel.getOtherNode(u);
-                Integer viObj = idToIdx.get(v.getId());
-                if (viObj == null) continue;
-                int vi = viObj;
+                Integer viObj = elementIdToIdx.get(v.getElementId());
+                if (viObj == null) continue; // Node doesn't have the required label
 
-                if (ui == vi) continue;
+                int vi = viObj;
+                if (ui == vi) continue; // Ignore self-loops
+
                 int a = Math.min(ui, vi);
                 int b = Math.max(ui, vi);
                 long key = (((long) a) << 32) | (b & 0xffffffffL);
@@ -105,211 +293,94 @@ public class ModularDecompositionProcedures {
             edges.add(new int[]{a, b});
         }
 
-        return new GraphExtract(nodes.size(), edges);
+        return new GraphExtract(nodes.size(), edges, idxToElementId);
     }
 
-    // Sage integration 
+    /**
+     * Build the result JSON using Jackson.
+     */
+    private String buildResultJson(MDNode tree, int nodeCount, int edgeCount) {
+        try {
+            ObjectNode result = objectMapper.createObjectNode();
+            result.put("nodeCount", nodeCount);
+            result.put("edgeCount", edgeCount);
 
-    private String runSageModularDecomposition(GraphExtract extract) throws Exception {
-        // 1) Extract Sage resources to temp dir
-        Path workDir = Files.createTempDirectory("neo4j-md-sage-");
-        Path sageRepoDir = workDir.resolve("sage-md");
-        Files.createDirectories(sageRepoDir);
-
-        // Required repo files (packaged under src/main/resources/sage-md/)
-        copyResourceToFile("/sage-md/corneil_habib_paul_tedder_algorithm.spyx",
-                sageRepoDir.resolve("corneil_habib_paul_tedder_algorithm.spyx"));
-        copyResourceToFile("/sage-md/corneil_habib_paul_tedder_algorithm_utils.sage",
-                sageRepoDir.resolve("corneil_habib_paul_tedder_algorithm_utils.sage"));
-
-        // 2) Write input graph JSON
-        Map<String, Object> input = new HashMap<>();
-        input.put("n", extract.n);
-        input.put("edges", extract.edges);
-
-        Path inputJson = workDir.resolve("graph.json");
-        Files.writeString(inputJson, MAPPER.writeValueAsString(input), StandardCharsets.UTF_8);
-
-        // 3) Write a runner script executed by "sage -python"
-        // It will:
-        // - load the .spyx
-        // - build a Sage Graph
-        // - compute modular decomposition tree
-        // - convert it to JSON
-        Path runnerPy = workDir.resolve("runner.py");
-        Files.writeString(runnerPy, buildRunnerScript(), StandardCharsets.UTF_8);
-
-        // 4) Run Sage
-        boolean windows = System.getProperty("os.name").toLowerCase().contains("win");
-
-        List<String> cmd = new ArrayList<>();
-
-        if (windows) {
-            String condaPrefix = "/home/fady/.local/share/mamba/envs/sage";
-            String wslSage = condaPrefix + "/bin/sage";
-            
-            String command =
-                "CONDA_PREFIX=" + condaPrefix + " " +
-                "PATH=" + condaPrefix + "/bin:$PATH " +
-                "PKG_CONFIG_PATH=" + condaPrefix + "/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig " +
-                wslSage + " -python " +
-                shellQuote(toWslPath(runnerPy)) + " " +
-                shellQuote(toWslPath(sageRepoDir)) + " " +
-                shellQuote(toWslPath(inputJson));
-            
-            cmd.add("wsl.exe");
-            cmd.add("bash");
-            cmd.add("-lc");
-            cmd.add(command);
-
-        } else {
-            // Neo4j running on Linux
-            String sageBin = Optional.ofNullable(System.getenv("SAGE_BIN")).orElse("sage");
-            cmd.add(sageBin);
-            cmd.add("-python");
-            cmd.add(runnerPy.toAbsolutePath().toString());
-            cmd.add(sageRepoDir.toAbsolutePath().toString());
-            cmd.add(inputJson.toAbsolutePath().toString());
-        }
-
-        ProcessBuilder pb = new ProcessBuilder(cmd);
-        pb.redirectErrorStream(true);
-        Process p = pb.start();
-        
-        // Hard timeout to avoid hanging Neo4j
-        boolean finished = p.waitFor(90, TimeUnit.SECONDS);
-        String output = readAll(p.getInputStream());
-
-        if (!finished) {
-            p.destroyForcibly();
-            throw new RuntimeException("Sage execution timed out");
-        }
-        if (p.exitValue() != 0) {
-            throw new RuntimeException("Sage failed (exit=" + p.exitValue() + "): " + output);
-        }
-
-        // Output is JSON on stdout
-        return output.trim();
-    }
-    private static String toWslPath(java.nio.file.Path p) {
-        String s = p.toAbsolutePath().toString();
-    
-        // If already a WSL path, keep as is
-        if (s.startsWith("/")) return s;
-    
-        // Convert Windows path like C:\Users\X\AppData\Local\Temp\...
-        // to /mnt/c/Users/X/AppData/Local/Temp/...
-        // Works for standard drive-letter paths.
-        if (s.length() >= 2 && s.charAt(1) == ':') {
-            char drive = Character.toLowerCase(s.charAt(0));
-            String rest = s.substring(2).replace('\\', '/');
-            return "/mnt/" + drive + rest;
-        }
-    
-        return s;
-    }
-    private static String shellQuote(String s) {
-        // Safe single-quote for bash
-        return "'" + s.replace("'", "'\"'\"'") + "'";
-    }
-    private static String buildRunnerScript() {
-        // We use Sage’s Node / NodeType structure and traverse children recursively.
-        // For NORMAL leaves, we try several attribute names for safety.
-        return """
-import json
-import sys
-
-from sage.all import Graph, load
-
-def node_type_name(node):
-    nt = getattr(node, "node_type", None)
-    if nt is None:
-        nt = getattr(node, "type", None)
-    s = str(nt)
-    # common formats: 'NodeType.SERIES' or 'SERIES'
-    if "." in s:
-        s = s.split(".")[-1]
-    return s
-
-def leaf_label(node):
-    for attr in ("vertex", "label", "value", "name"):
-        if hasattr(node, attr):
-            v = getattr(node, attr)
-            if callable(v):
-                try:
-                    v = v()
-                except Exception:
-                    continue
-            return v
-    # fallback
-    return str(node)
-
-def node_to_dict(node):
-    children = getattr(node, "children", None)
-    if children is None:
-        children = []
-    # if no children -> leaf
-    if len(children) == 0:
-        return {"type": "NORMAL", "label": leaf_label(node)}
-
-    return {
-        "type": node_type_name(node),
-        "children": [node_to_dict(c) for c in children]
-    }
-
-def main():
-    sage_repo_dir = sys.argv[1]
-    input_json = sys.argv[2]
-
-    # Make sure the repo dir is on Sage load path
-    import os
-    os.chdir(sage_repo_dir)
-
-    # Load the implementation from the paper repo
-    load("corneil_habib_paul_tedder_algorithm.spyx")
-
-    with open(input_json, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    n = int(data["n"])
-    edges = data["edges"]
-
-    G = Graph(n)
-    for e in edges:
-        u = int(e[0])
-        v = int(e[1])
-        if u != v:
-            G.add_edge(u, v)
-
-    root = corneil_habib_paul_tedder_algorithm(G)
-    out = {
-        "n": n,
-        "edge_count": len(edges),
-        "md_tree": node_to_dict(root)
-    }
-    print(json.dumps(out, ensure_ascii=False))
-
-if __name__ == "__main__":
-    main()
-""";
-    }
-
-    private static void copyResourceToFile(String resourcePath, Path target) throws IOException {
-        try (InputStream is = ModularDecompositionProcedures.class.getResourceAsStream(resourcePath)) {
-            if (is == null) {
-                throw new FileNotFoundException("Missing resource in JAR: " + resourcePath);
+            if (tree != null) {
+                result.set("mdTree", buildTreeJson(tree));
+            } else {
+                result.putNull("mdTree");
             }
-            Files.copy(is, target, StandardCopyOption.REPLACE_EXISTING);
+
+            return objectMapper.writeValueAsString(result);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialize result to JSON", e);
+            throw new RuntimeException("JSON serialization failed", e);
         }
     }
 
-    private static String readAll(InputStream is) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] buf = new byte[8192];
-        int r;
-        while ((r = is.read(buf)) != -1) {
-            baos.write(buf, 0, r);
+    /**
+     * Recursively build JSON representation of the MD tree.
+     */
+    private ObjectNode buildTreeJson(MDNode node) {
+        ObjectNode json = objectMapper.createObjectNode();
+        json.put("type", node.getType().name());
+
+        if (node.isLeaf() && node.getVertex() != null) {
+            json.put("vertex", node.getVertex());
+        } else if (!node.getChildren().isEmpty()) {
+            ArrayNode children = objectMapper.createArrayNode();
+            for (MDNode child : node.getChildren()) {
+                children.add(buildTreeJson(child));
+            }
+            json.set("children", children);
         }
-        return baos.toString(StandardCharsets.UTF_8);
+
+        return json;
+    }
+
+    /**
+     * Build JSON mapping from internal indices to Neo4j element IDs.
+     */
+    private String buildMappingJson(Map<Integer, String> idMapping) {
+        try {
+            ObjectNode mapping = objectMapper.createObjectNode();
+            for (Map.Entry<Integer, String> entry : idMapping.entrySet()) {
+                mapping.put(String.valueOf(entry.getKey()), entry.getValue());
+            }
+            return objectMapper.writeValueAsString(mapping);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialize mapping to JSON", e);
+            throw new RuntimeException("JSON serialization failed", e);
+        }
+    }
+
+    /**
+     * Get statistics about the procedure configuration.
+     *
+     * @return Stream containing configuration information
+     */
+    @Procedure(name = "md.info", mode = Mode.READ)
+    @Description("Returns information about the md procedures configuration")
+    public Stream<InfoResult> info() {
+        return Stream.of(new InfoResult(
+                "0.2.0",
+                DEFAULT_MAX_NODES,
+                DEFAULT_TIMEOUT_MS
+        ));
+    }
+
+    /**
+     * Result class for md.info procedure.
+     */
+    public static class InfoResult {
+        public String version;
+        public long defaultMaxNodes;
+        public long defaultTimeoutMs;
+
+        public InfoResult(String version, long defaultMaxNodes, long defaultTimeoutMs) {
+            this.version = version;
+            this.defaultMaxNodes = defaultMaxNodes;
+            this.defaultTimeoutMs = defaultTimeoutMs;
+        }
     }
 }

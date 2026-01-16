@@ -1,0 +1,27 @@
+services:
+  neo4j:
+    image: neo4j:5
+    container_name: neo4j-md-test
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/testpassword
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=md.*,apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=md.*,apoc.*
+    volumes:
+      - ./build/libs:/plugins
+      - ./examples:/examples
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - neo4j_network
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+
+networks:
+  neo4j_network:
+    driver: bridge

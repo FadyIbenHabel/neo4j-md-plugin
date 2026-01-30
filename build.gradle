@@ -41,11 +41,6 @@ jar {
             "Implementation-Vendor": "org.example"
         )
     }
-
-    // Include license info
-    from('LICENSE') {
-        into 'META-INF'
-    }
 }
 
 java {

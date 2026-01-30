@@ -118,12 +118,13 @@ public class ModularDecompositionProcedures {
      */
     @Procedure(name = "md.computeWithConfig", mode = Mode.READ)
     @Description("CALL md.computeWithConfig(label, relType, maxNodes, timeoutMs) - " +
-                 "Computes modular decomposition with custom size limit and timeout")
+                 "Computes modular decomposition with custom size limit and timeout. " +
+                 "Use -1 for default values.")
     public Stream<MdResult> computeWithConfig(
             @Name("label") String label,
             @Name("relType") String relType,
-            @Name(value = "maxNodes", defaultValue = "null") Long maxNodes,
-            @Name(value = "timeoutMs", defaultValue = "null") Long timeoutMs
+            @Name(value = "maxNodes", defaultValue = "-1") Long maxNodes,
+            @Name(value = "timeoutMs", defaultValue = "-1") Long timeoutMs
     ) {
         long startTime = System.currentTimeMillis();
 
@@ -131,8 +132,8 @@ public class ModularDecompositionProcedures {
         validateInput(label, "label");
         validateInput(relType, "relType");
 
-        int effectiveMaxNodes = maxNodes != null ? maxNodes.intValue() : DEFAULT_MAX_NODES;
-        long effectiveTimeoutMs = timeoutMs != null ? timeoutMs : DEFAULT_TIMEOUT_MS;
+        int effectiveMaxNodes = (maxNodes == null || maxNodes < 0) ? DEFAULT_MAX_NODES : maxNodes.intValue();
+        long effectiveTimeoutMs = (timeoutMs == null || timeoutMs < 0) ? DEFAULT_TIMEOUT_MS : timeoutMs;
 
         log.info("Starting md.compute for label='{}', relType='{}', maxNodes={}, timeoutMs={}",
                 label, relType, effectiveMaxNodes, effectiveTimeoutMs);
@@ -274,7 +275,7 @@ public class ModularDecompositionProcedures {
             for (Relationship rel : u.getRelationships(Direction.BOTH, R)) {
                 Node v = rel.getOtherNode(u);
                 Integer viObj = elementIdToIdx.get(v.getElementId());
-                if (viObj == null) continue; // Node doesn't have the required label
+                if (viObj == null) continue; // Node lacks the required label
 
                 int vi = viObj;
                 if (ui == vi) continue; // Ignore self-loops

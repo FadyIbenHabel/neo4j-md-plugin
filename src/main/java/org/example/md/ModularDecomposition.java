@@ -893,7 +893,7 @@ public class ModularDecomposition {
                 rp = r;
                 t = NodeType.PARALLEL;
             } else {
-                // Shouldn't reach here, but default to SERIES
+                // Unreachable, but default to SERIES
                 lp = l;
                 rp = r;
                 t = NodeType.SERIES;
@@ -1068,39 +1068,6 @@ public class ModularDecomposition {
     }
 
     /**
-     * Check if new vertices have non-uniform adjacency to current vertices.
-     * For SERIES, all new vertices should be adjacent to all current vertices.
-     * For PARALLEL, no new vertex should be adjacent to any current vertex.
-     * If neither holds, we have PRIME.
-     */
-    private static boolean hasNonUniformAdjacency(Graph graph, Set<Integer> newVerts,
-                                                   Set<Integer> currentVerts, NodeType expectedType) {
-        if (newVerts.isEmpty() || currentVerts.isEmpty()) {
-            return false;
-        }
-
-        for (int newV : newVerts) {
-            int adjCount = 0;
-            for (int curV : currentVerts) {
-                if (graph.hasEdge(newV, curV)) {
-                    adjCount++;
-                }
-            }
-
-            // For SERIES: new vertex must be adjacent to ALL current vertices
-            // For PARALLEL: new vertex must be adjacent to NO current vertices
-            if (expectedType == NodeType.SERIES && adjCount != currentVerts.size()) {
-                return true; // Non-uniform: not fully connected
-            }
-            if (expectedType == NodeType.PARALLEL && adjCount != 0) {
-                return true; // Non-uniform: has some connections
-            }
-        }
-
-        return false;
-    }
-
-    /**
      * Add a node to root, handling degenerate node flattening
      */
     private static void addToRoot(InternalNode root, InternalNode node, NodeType rootType) {
@@ -1127,28 +1094,6 @@ public class ModularDecomposition {
                 addToPrimeNode(primeRoot, child);
             }
         }
-    }
-
-    /**
-     * Check if two clusters are non-adjacent.
-     * Corresponds to _are_cluster_non_adjacent in Cython (lines 1560-1572).
-     */
-    private static boolean areClustersNonAdjacent(Graph graph, List<List<Module>> clusters, int i, int j) {
-        if (i < 0 || i >= clusters.size() || j < 0 || j >= clusters.size()) {
-            return true;
-        }
-
-        for (Module mi : clusters.get(i)) {
-            int vi = mi.leftmost.vertex;
-            for (Module mj : clusters.get(j)) {
-                int vj = mj.leftmost.vertex;
-                if (graph.hasEdge(vi, vj)) {
-                    return false;
-                }
-            }
-        }
-
-        return true;
     }
 
     /**

@@ -80,14 +80,14 @@ Output:
 
 ```json
 {
-  "n": 3,
-  "edge_count": 3,
-  "md_tree": {
+  "nodeCount": 3,
+  "edgeCount": 3,
+  "mdTree": {
     "type": "SERIES",
     "children": [
-      {"type": "NORMAL", "label": 0},
-      {"type": "NORMAL", "label": 1},
-      {"type": "NORMAL", "label": 2}
+      {"type": "NORMAL", "vertex": 0},
+      {"type": "NORMAL", "vertex": 1},
+      {"type": "NORMAL", "vertex": 2}
     ]
   }
 }
@@ -135,19 +135,11 @@ src/main/java/org/example/md/
 by Corneil, Habib, Lanlignel, Reed, and Rotics
 SIAM Journal on Discrete Mathematics, 2008
 
-## Team Contributions
+## Team
 
-### [Name 1]
-- Core algorithm implementation
-- Test suite
-
-### [Name 2]
-- Neo4j procedure interface
-- Documentation
-
-### [Name 3]
-- Build configuration
-- Example queries
+- Ameur Wassim
+- Fady Iben Habel
+- Youssef
 
 ---
 

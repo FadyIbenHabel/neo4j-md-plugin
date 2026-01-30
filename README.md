@@ -139,7 +139,7 @@ SIAM Journal on Discrete Mathematics, 2008
 
 - Ameur Wassim
 - Fady Iben Habel
-- Youssef
+- Youssef Ben Hariz
 
 ---
 
